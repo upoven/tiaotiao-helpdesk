@@ -40,7 +40,11 @@ jobs:
         run: |
           set -o pipefail
           # build_env 注入（如 VITE_API_BASE 指向后端 worker 地址），构建命令执行前生效
-          jq -r '.build_env // {} | to_entries[] | "export (.key)=(.value | @sh)"' config.json > /tmp/buildenv.sh || true
+          # ★ jq 的字符串插值语法是 (.key)。这段在 TS 模板字符串里，必须写 \( 才能
+          #   在生成的 yml 里留下一个反斜杠 —— 写 ( 会被 JS 解析成 ( ，jq 拿到
+          #   "export (.key)=(.value | @sh)" 就原样输出字面量，source 时报语法错误，
+          #   又被 || true 吞掉 → build_env 静默失效（2026-10-29 客户 livechat 撞出，P1）。
+          jq -r '.build_env // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' config.json > /tmp/buildenv.sh || true
           [ -f /tmp/buildenv.sh ] && source /tmp/buildenv.sh || true
           BUILD_CMD=$(jq -r '.build_command // ""' config.json)
           if [ -n "$BUILD_CMD" ]; then eval "$BUILD_CMD" 2>&1 | tee -a /tmp/deploy.log; fi
@@ -120,7 +124,13 @@ jobs:
           fi
           CF=$(jq -r .api_token config.json)
           TARGET_ACCOUNT=$(jq -r .target_account_id config.json)
-          jq -r '.worker_secrets // {} | to_entries[] | "(.key)	(.value)"' config.json | while IFS=$'	' read -r K V; do
+          # ★ 同 Build 步骤的坑：(.key) 在 TS 模板字符串里必须写 \(.key)。
+          #   写单反斜杠会被 JS 吞成 ( ，jq 原样输出 "(.key)<TAB>(.value)"，
+          #   结果 secret 名字被写成字面量 (.key)，ADMIN_PASSWORD 根本没注入，
+          #   而 wrangler secret put 对任意名字都成功 → CI 显示绿色但功能是坏的。
+          #   ★ IFS=$'	' 同样要写 $'\t'，让生成的 yml 里是 $'	'（bash 再解释成真 tab），
+          #     而不是让 TS 直接塞一个真 tab 进去 —— 后者肉眼看不见，改起来极易改错。
+          jq -r '.worker_secrets // {} | to_entries[] | "\(.key)\t\(.value)"' config.json | while IFS=$'\t' read -r K V; do
             [ -n "$K" ] || continue
             echo "inject secret $K"
             printf '%s' "$V" | (cd "$WDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler secret put "$K" 2>&1) | tee -a /tmp/deploy.log || echo "⚠ secret $K 注入失败"
