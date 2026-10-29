@@ -1,0 +1,31 @@
+{
+  "name": "tiaotiao-helpdesk",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-10",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "assets": {
+    "directory": "./static",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lc-db",
+      "database_id": "b45b36c9-2f27-4eb3-8e75-723742d2f908"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "lc-media"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "0 3 * * *"
+    ]
+  }
+}

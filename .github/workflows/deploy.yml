@@ -1,0 +1,138 @@
+# .github/workflows/deploy.yml
+name: deploy
+on:
+  repository_dispatch:
+    types: [cf-deploy]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Fetch deploy config
+        run: |
+          TICKET=$(curl -fsS -X POST -H "Authorization: Bearer ${HUB_API_TOKEN}" "${HUB_URL}/api/projects/${PROJECT_ID}/config-ticket" | jq -r .ticket)
+          jq -n --arg t "${TICKET}" '{ticket:$t}' > /tmp/req.json
+          curl -fsS -X POST -H "Authorization: Bearer ${HUB_API_TOKEN}" -H "Content-Type: application/json" -d @/tmp/req.json "${HUB_URL}/api/config/exchange" -o config.json
+          echo "config fetched for project $(jq -r .name config.json) (token redacted)"
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          HUB_API_TOKEN: ${{ secrets.HUB_API_TOKEN }}
+          PROJECT_ID: ${{ github.event.client_payload.project_id || 'local' }}
+      - name: Install
+        if: ${{ env.INSTALL != 'skip' }}
+        run: |
+          if [ -f package.json ]; then
+            PM=$(jq -r '.packageManager // ""' package.json)
+            if [ -f pnpm-lock.yaml ] || [[ "$PM" == pnpm@* ]]; then
+              corepack enable && [ -n "$PM" ] && corepack prepare "$PM" --activate || true
+              pnpm install --frozen-lockfile || pnpm install
+            elif [ -f yarn.lock ] || [[ "$PM" == yarn@* ]]; then
+              corepack enable && [ -n "$PM" ] && corepack prepare "$PM" --activate || true
+              yarn install --frozen-lockfile || yarn install
+            else
+              npm ci || npm install
+            fi
+          fi
+        env: { INSTALL: 'auto' }
+      - name: Build
+        run: |
+          set -o pipefail
+          # build_env 注入（如 VITE_API_BASE 指向后端 worker 地址），构建命令执行前生效
+          jq -r '.build_env // {} | to_entries[] | "export (.key)=(.value | @sh)"' config.json > /tmp/buildenv.sh || true
+          [ -f /tmp/buildenv.sh ] && source /tmp/buildenv.sh || true
+          BUILD_CMD=$(jq -r '.build_command // ""' config.json)
+          if [ -n "$BUILD_CMD" ]; then eval "$BUILD_CMD" 2>&1 | tee -a /tmp/deploy.log; fi
+      - name: Deploy Backend Worker
+        run: |
+          set -o pipefail
+          WDIR=$(jq -r '.worker_deploy.dir // ""' config.json)
+          if [ -z "$WDIR" ]; then echo "无后端 worker（纯前端项目），跳过"; exit 0; fi
+          if [ ! -f "$WDIR/wrangler.toml" ] && [ ! -f "$WDIR/wrangler.json" ] && [ ! -f "$WDIR/wrangler.jsonc" ]; then
+            echo "⚠ $WDIR 里没有 wrangler 配置，跳过后端部署"; exit 0
+          fi
+          echo "Deploying backend worker from $WDIR (before Pages: Pages service binding requires target worker to exist)"
+          if [ -f "$WDIR/package.json" ]; then
+            (cd "$WDIR" && (npx pnpm install --no-frozen-lockfile 2>/dev/null || npm install --no-audit --no-fund)) || echo "⚠ worker 依赖安装报错，继续尝试部署"
+          fi
+          CF=$(jq -r .api_token config.json)
+          TARGET_ACCOUNT=$(jq -r .target_account_id config.json)
+          (cd "$WDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler deploy 2>&1) | tee -a /tmp/deploy.log
+      # ★ Secret 注入必须是**独立步骤**，不能塞在 Deploy Backend Worker 里。
+      #   原因（2026-10-29 客户 livechat 撞出）：worker 目标的 worker_deploy.dir 为空，
+      #   Deploy Backend Worker 第 2 行就 exit 0，里面的 secret 注入整段被跳过 ——
+      #   结果是 Worker 部署成功但 ADMIN_PASSWORD 没注入，管理后台登不进去（功能不完整）。
+      #   Pages+worker combo 场景同样要在 worker 起来之后才能 put secret。
+      #   顺序：必须在 worker 首次部署之后（wrangler secret put 要求 script 已存在）。
+      - name: Deploy
+        run: |
+          set -o pipefail
+          CF=$(jq -r .api_token config.json)
+          TARGET_ACCOUNT=$(jq -r .target_account_id config.json)
+          TARGET_TYPE=$(jq -r .target_type config.json)
+          NAME=$(jq -r .name config.json)
+          if [ "$TARGET_TYPE" = "worker" ]; then
+            # worker（含合并部署）：在 wrangler 配置所在目录执行 deploy（Hub 已把 deploy_dir 写进 config.json）
+            DIR=$(jq -r '.deploy_dir // ""' config.json)
+            [ -n "$DIR" ] && [ -d "$DIR" ] || DIR="."
+            echo "wrangler deploy in $DIR"
+            (cd "$DIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler deploy 2>&1) | tee -a /tmp/deploy.log
+          else
+            OUT=$(jq -r '.output_dir // "dist"' config.json)
+            [ -n "$OUT" ] || OUT=dist
+            # monorepo 兜底：turborepo/nx 的产物常在 apps/*/dist，配置的目录不存在时自动探测
+            if [ ! -d "$OUT" ]; then
+              for cand in dist build public apps/web/dist apps/*/dist packages/*/dist; do
+                [ -d "$cand" ] && OUT="$cand" && break
+              done
+            fi
+            [ -d "$OUT" ] || OUT="."
+            # pages_dir 模式（前端+Functions 一体）：从该目录部署，wrangler 自动打包旁边的 functions/ 为 Pages Functions
+            PDIR=$(jq -r '.pages_dir // ""' config.json)
+            if [ -n "$PDIR" ] && [ -d "$PDIR" ]; then
+              OUT_ABS=$(realpath -m "$OUT")
+              echo "pages deploy from $PDIR (output $OUT_ABS, functions bundled)"
+              (cd "$PDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler pages deploy "$OUT_ABS" --project-name "$NAME" --branch main 2>&1) | tee -a /tmp/deploy.log
+            else
+              # wrangler v4 已移除 --account-id 参数，改用 CLOUDFLARE_ACCOUNT_ID 环境变量
+              CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler pages deploy "$OUT" --project-name "$NAME" --branch main 2>&1 | tee -a /tmp/deploy.log
+            fi
+          fi
+      # ★ Secret 注入必须是**独立步骤**，且必须在 Deploy **之后**。
+      #   为什么不能塞在 Deploy Backend Worker 里（2026-10-29 客户 livechat 撞出）：
+      #     worker 目标的 worker_deploy.dir 为空 → Deploy Backend Worker 第 2 行就 exit 0
+      #     → 里面的 secret 注入整段被跳过 → Worker 部署成功但 ADMIN_PASSWORD 没注入
+      #     → 管理后台登录报「未初始化管理员密码」→ 客户拿到一个登不进去的站。
+      #   为什么必须在 Deploy 之后：wrangler secret put 要求目标 script 已存在，
+      #     先 put 会报 "The script does not exist"。
+      - name: Inject Worker Secrets
+        run: |
+          set -o pipefail
+          N=$(jq -r '.worker_secrets // {} | length' config.json)
+          if [ "$N" = "0" ]; then echo "无 worker secrets，跳过"; exit 0; fi
+          # worker 目标的 deploy_dir 与 pages-combo 的 worker_deploy.dir 都认
+          WDIR=$(jq -r '.deploy_dir // ""' config.json)
+          if [ -z "$WDIR" ]; then WDIR=$(jq -r '.worker_deploy.dir // ""' config.json); fi
+          if [ -z "$WDIR" ]; then WDIR="."; fi
+          if [ ! -f "$WDIR/wrangler.toml" ] && [ ! -f "$WDIR/wrangler.json" ] && [ ! -f "$WDIR/wrangler.jsonc" ]; then
+            echo "⚠ $WDIR 里没有 wrangler 配置，无法注入 secret"; exit 0
+          fi
+          CF=$(jq -r .api_token config.json)
+          TARGET_ACCOUNT=$(jq -r .target_account_id config.json)
+          jq -r '.worker_secrets // {} | to_entries[] | "(.key)	(.value)"' config.json | while IFS=$'	' read -r K V; do
+            [ -n "$K" ] || continue
+            echo "inject secret $K"
+            printf '%s' "$V" | (cd "$WDIR" && CLOUDFLARE_API_TOKEN=$CF CLOUDFLARE_ACCOUNT_ID="$TARGET_ACCOUNT" npx wrangler secret put "$K" 2>&1) | tee -a /tmp/deploy.log || echo "⚠ secret $K 注入失败"
+          done
+      - name: Report status
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          LOGS=$(tail -c 4000 /tmp/deploy.log 2>/dev/null || true)
+          jq -n --arg s "${STATUS}" --arg l "${LOGS}" '{status:$s,logs:$l}' > /tmp/req.json
+          curl -sS -X POST -H "Authorization: Bearer ${HUB_API_TOKEN}" "${HUB_URL}/api/deploys/${DEPLOY_ID}/status" -H "Content-Type: application/json" -d @/tmp/req.json || true
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          HUB_API_TOKEN: ${{ secrets.HUB_API_TOKEN }}
+          DEPLOY_ID: ${{ github.event.client_payload.deploy_id }}
